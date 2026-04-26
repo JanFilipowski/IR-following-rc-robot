@@ -3,139 +3,384 @@
 #include <RF24.h>
 #include <ctype.h>
 #include <string.h>
+#include <avr/interrupt.h>
 
 #include "protocol.h"
 
-// TX pinout for button-only controller
-static constexpr uint8_t PIN_LEFT_FWD  = 2;
-static constexpr uint8_t PIN_LEFT_REV  = 3;
-static constexpr uint8_t PIN_RIGHT_REV = 4;
-static constexpr uint8_t PIN_RIGHT_FWD = 5;
-static constexpr uint8_t PIN_MODE      = 6;   // toggle MANUAL/AUTO
-static constexpr uint8_t PIN_BTN_A1    = 7;
-static constexpr uint8_t PIN_BTN_A2    = 8;
+const int LEFT_IN1  = 6;
+const int LEFT_IN2  = 5;
+const int RIGHT_IN1 = 10;
+const int RIGHT_IN2 = 9;
 
-static constexpr uint8_t PIN_RADIO_CE  = 9;
-static constexpr uint8_t PIN_RADIO_CSN = 10;
+const byte CE_PIN  = 7;
+const byte CSN_PIN = 8;
 
-static constexpr unsigned long DEBOUNCE_MS        = 25;
-static constexpr unsigned long MODE_RETRY_MS      = 300;
-static constexpr unsigned long STATE_RETRY_MS     = 120;
-static constexpr unsigned long DRIVE_HEARTBEAT_MS = 180;
+// ===== IR sensors =====
+// faktyczne przypisanie:
+const byte IR_LEFT_PIN   = 2;   // D2 = PD2
+const byte IR_RIGHT_PIN  = 3;   // D3 = PD3
+const byte IR_CENTER_PIN = 4;   // D4 = PD4
 
-struct DebouncedButton {
-  uint8_t pin;
-  bool lastReading;
-  bool stableState;
-  unsigned long lastChangeMs;
-};
+const unsigned long IR_DEBOUNCE_US = 300;
 
-RF24 radio(PIN_RADIO_CE, PIN_RADIO_CSN);
+// ===== AUTO config =====
+static constexpr bool AUTO_USE_PWM = false;   // <-- zmień na false, aby AUTO było bez PWM
 
-DebouncedButton modeBtn      = {PIN_MODE,      HIGH, HIGH, 0};
-DebouncedButton leftFwdBtn   = {PIN_LEFT_FWD,  HIGH, HIGH, 0};
-DebouncedButton leftRevBtn   = {PIN_LEFT_REV,  HIGH, HIGH, 0};
-DebouncedButton rightFwdBtn  = {PIN_RIGHT_FWD, HIGH, HIGH, 0};
-DebouncedButton rightRevBtn  = {PIN_RIGHT_REV, HIGH, HIGH, 0};
-DebouncedButton a1Btn        = {PIN_BTN_A1,    HIGH, HIGH, 0};
-DebouncedButton a2Btn        = {PIN_BTN_A2,    HIGH, HIGH, 0};
+const unsigned long AUTO_UPDATE_MS = 100;
+
+const uint16_t IR_NONE_THRESHOLD   = 2;
+const uint16_t IR_STRONG_THRESHOLD = 15;
+const int IR_SIDE_MARGIN           = 4;
+
+// PWM / continuous steering tuning
+const int AUTO_BASE_SPEED_PWM      = 85;
+const int AUTO_SLOW_SPEED_PWM      = 60;
+const int AUTO_SEARCH_SPEED_PWM    = 70;
+const int AUTO_MAX_SPEED_PWM       = 140;
+const int AUTO_TURN_GAIN           = 10;
+const int AUTO_MAX_TURN_PWM        = 90;
+
+// non-PWM fallback still uses same logic, but outputs full ON/OFF
+const int AUTO_BINARY_THRESHOLD    = 10;
+
+volatile uint16_t irHitsLeft   = 0;
+volatile uint16_t irHitsCenter = 0;
+volatile uint16_t irHitsRight  = 0;
+
+volatile unsigned long irLastEdgeLeftUs   = 0;
+volatile unsigned long irLastEdgeCenterUs = 0;
+volatile unsigned long irLastEdgeRightUs  = 0;
+
+volatile uint8_t lastPortDState = 0;
+
+RF24 radio(CE_PIN, CSN_PIN);
+
+Packet data;
 
 uint8_t currentMode = MODE_MANUAL;
+uint8_t lastMode = 255;
+
+unsigned long lastManualPacketTime = 0;
+const unsigned long SIGNAL_TIMEOUT = 300;
+
 bool debugEnabled = false;
-
-Packet desiredPacket{MODE_MANUAL, 0};
-Packet lastAckedPacket{MODE_MANUAL, 0};
-Packet lastAttemptedPacket{MODE_MANUAL, 0};
-
-bool haveAckedPacket = false;
-bool haveAttemptedPacket = false;
-
-unsigned long lastAttemptMs = 0;
-unsigned long lastAckMs = 0;
 
 char serialBuf[32];
 uint8_t serialLen = 0;
 
-static void updateDebouncedButton(DebouncedButton &btn) {
-  const bool reading = digitalRead(btn.pin);
+// ===== AUTO state =====
+unsigned long lastAutoUpdateMs = 0;
+int8_t lastSeenDirection = 1;   // -1 = lewo, +1 = prawo
+uint16_t lastAutoL = 0;
+uint16_t lastAutoC = 0;
+uint16_t lastAutoR = 0;
 
-  if (reading != btn.lastReading) {
-    btn.lastReading = reading;
-    btn.lastChangeMs = millis();
+// ===== IR helpers =====
+
+static void resetIrCounters() {
+  noInterrupts();
+  irHitsLeft = 0;
+  irHitsCenter = 0;
+  irHitsRight = 0;
+  irLastEdgeLeftUs = 0;
+  irLastEdgeCenterUs = 0;
+  irLastEdgeRightUs = 0;
+  interrupts();
+}
+
+static void snapshotAndClearIrCounters(uint16_t &l, uint16_t &c, uint16_t &r) {
+  noInterrupts();
+  l = irHitsLeft;
+  c = irHitsCenter;
+  r = irHitsRight;
+  irHitsLeft = 0;
+  irHitsCenter = 0;
+  irHitsRight = 0;
+  interrupts();
+}
+
+static void setupIrSensors() {
+  pinMode(IR_LEFT_PIN, INPUT);
+  pinMode(IR_CENTER_PIN, INPUT);
+  pinMode(IR_RIGHT_PIN, INPUT);
+
+  lastPortDState = PIND;
+
+  // Pin Change Interrupt dla portu D
+  PCICR |= _BV(PCIE2);
+
+  // D2, D3, D4 -> PCINT18, PCINT19, PCINT20
+  PCMSK2 |= _BV(PCINT18);
+  PCMSK2 |= _BV(PCINT19);
+  PCMSK2 |= _BV(PCINT20);
+}
+
+ISR(PCINT2_vect) {
+  uint8_t nowState = PIND;
+  uint8_t changed = nowState ^ lastPortDState;
+  uint8_t falling = changed & lastPortDState & (~nowState);
+  lastPortDState = nowState;
+
+  unsigned long nowUs = micros();
+
+  // LEFT = D2 = PD2
+  if (falling & _BV(PD2)) {
+    if (nowUs - irLastEdgeLeftUs > IR_DEBOUNCE_US) {
+      irHitsLeft++;
+      irLastEdgeLeftUs = nowUs;
+    }
   }
 
-  if ((millis() - btn.lastChangeMs) > DEBOUNCE_MS) {
-    btn.stableState = reading;
+  // RIGHT = D3 = PD3
+  if (falling & _BV(PD3)) {
+    if (nowUs - irLastEdgeRightUs > IR_DEBOUNCE_US) {
+      irHitsRight++;
+      irLastEdgeRightUs = nowUs;
+    }
+  }
+
+  // CENTER = D4 = PD4
+  if (falling & _BV(PD4)) {
+    if (nowUs - irLastEdgeCenterUs > IR_DEBOUNCE_US) {
+      irHitsCenter++;
+      irLastEdgeCenterUs = nowUs;
+    }
   }
 }
 
-static bool debouncedPressed(DebouncedButton &btn) {
-  const bool previousStable = btn.stableState;
-  updateDebouncedButton(btn);
-  return (previousStable == HIGH && btn.stableState == LOW);
+// ===== Motor helpers =====
+
+// binary/manual
+static void setLeftTrack(int dir) {
+  if (dir > 0) {
+    digitalWrite(LEFT_IN1, HIGH);
+    digitalWrite(LEFT_IN2, LOW);
+  } else if (dir < 0) {
+    digitalWrite(LEFT_IN1, LOW);
+    digitalWrite(LEFT_IN2, HIGH);
+  } else {
+    digitalWrite(LEFT_IN1, LOW);
+    digitalWrite(LEFT_IN2, LOW);
+  }
 }
 
-static void updateStateButtons() {
-  updateDebouncedButton(leftFwdBtn);
-  updateDebouncedButton(leftRevBtn);
-  updateDebouncedButton(rightFwdBtn);
-  updateDebouncedButton(rightRevBtn);
-  updateDebouncedButton(a1Btn);
-  updateDebouncedButton(a2Btn);
+static void setRightTrack(int dir) {
+  if (dir > 0) {
+    digitalWrite(RIGHT_IN1, HIGH);
+    digitalWrite(RIGHT_IN2, LOW);
+  } else if (dir < 0) {
+    digitalWrite(RIGHT_IN1, LOW);
+    digitalWrite(RIGHT_IN2, HIGH);
+  } else {
+    digitalWrite(RIGHT_IN1, LOW);
+    digitalWrite(RIGHT_IN2, LOW);
+  }
 }
 
-static uint8_t buildButtonsBitmask() {
-  uint8_t mask = 0;
+static void stopMotors() {
+  analogWrite(LEFT_IN1, 0);
+  analogWrite(LEFT_IN2, 0);
+  analogWrite(RIGHT_IN1, 0);
+  analogWrite(RIGHT_IN2, 0);
 
-  if (leftFwdBtn.stableState == LOW)  mask |= BTN_MASK_LEFT_FWD;
-  if (leftRevBtn.stableState == LOW)  mask |= BTN_MASK_LEFT_REV;
-  if (rightFwdBtn.stableState == LOW) mask |= BTN_MASK_RIGHT_FWD;
-  if (rightRevBtn.stableState == LOW) mask |= BTN_MASK_RIGHT_REV;
-  if (a1Btn.stableState == LOW)       mask |= BTN_MASK_A1;
-  if (a2Btn.stableState == LOW)       mask |= BTN_MASK_A2;
-
-  return mask;
+  digitalWrite(LEFT_IN1, LOW);
+  digitalWrite(LEFT_IN2, LOW);
+  digitalWrite(RIGHT_IN1, LOW);
+  digitalWrite(RIGHT_IN2, LOW);
 }
 
-static void buildDesiredPacket() {
-  desiredPacket.mode = currentMode;
-  desiredPacket.buttons_bitmask = buildButtonsBitmask();
+static void setLeftTrackAuto(int speedVal) {
+  speedVal = constrain(speedVal, -255, 255);
+
+  if (!AUTO_USE_PWM) {
+    if (speedVal > AUTO_BINARY_THRESHOLD) {
+      digitalWrite(LEFT_IN1, HIGH);
+      digitalWrite(LEFT_IN2, LOW);
+    } else if (speedVal < -AUTO_BINARY_THRESHOLD) {
+      digitalWrite(LEFT_IN1, LOW);
+      digitalWrite(LEFT_IN2, HIGH);
+    } else {
+      digitalWrite(LEFT_IN1, LOW);
+      digitalWrite(LEFT_IN2, LOW);
+    }
+    return;
+  }
+
+  if (speedVal > 0) {
+    analogWrite(LEFT_IN1, speedVal);
+    digitalWrite(LEFT_IN2, LOW);
+  } else if (speedVal < 0) {
+    digitalWrite(LEFT_IN1, LOW);
+    analogWrite(LEFT_IN2, -speedVal);
+  } else {
+    digitalWrite(LEFT_IN1, LOW);
+    digitalWrite(LEFT_IN2, LOW);
+  }
 }
 
-static void printPacket(const char *prefix, const Packet &p, bool ok, const char *reason) {
-  Serial.print(prefix);
-  Serial.print(" MODE=");
-  Serial.print(p.mode == MODE_MANUAL ? "MANUAL" : "AUTO");
-  Serial.print(" BUTTONS=0x");
-  if (p.buttons_bitmask < 16) Serial.print('0');
-  Serial.print(p.buttons_bitmask, HEX);
-  Serial.print(" TX=");
-  Serial.print(ok ? "OK" : "FAIL");
-  Serial.print(" REASON=");
-  Serial.println(reason);
+static void setRightTrackAuto(int speedVal) {
+  speedVal = constrain(speedVal, -255, 255);
+
+  if (!AUTO_USE_PWM) {
+    if (speedVal > AUTO_BINARY_THRESHOLD) {
+      digitalWrite(RIGHT_IN1, HIGH);
+      digitalWrite(RIGHT_IN2, LOW);
+    } else if (speedVal < -AUTO_BINARY_THRESHOLD) {
+      digitalWrite(RIGHT_IN1, LOW);
+      digitalWrite(RIGHT_IN2, HIGH);
+    } else {
+      digitalWrite(RIGHT_IN1, LOW);
+      digitalWrite(RIGHT_IN2, LOW);
+    }
+    return;
+  }
+
+  if (speedVal > 0) {
+    analogWrite(RIGHT_IN1, speedVal);
+    digitalWrite(RIGHT_IN2, LOW);
+  } else if (speedVal < 0) {
+    digitalWrite(RIGHT_IN1, LOW);
+    analogWrite(RIGHT_IN2, -speedVal);
+  } else {
+    digitalWrite(RIGHT_IN1, LOW);
+    digitalWrite(RIGHT_IN2, LOW);
+  }
 }
+
+// ===== MANUAL =====
+
+static void runManualMode(const Packet &p) {
+  const bool leftFwd  = (p.buttons_bitmask & BTN_MASK_LEFT_FWD)  != 0;
+  const bool leftRev  = (p.buttons_bitmask & BTN_MASK_LEFT_REV)  != 0;
+  const bool rightFwd = (p.buttons_bitmask & BTN_MASK_RIGHT_FWD) != 0;
+  const bool rightRev = (p.buttons_bitmask & BTN_MASK_RIGHT_REV) != 0;
+
+  int leftDir = 0;
+  int rightDir = 0;
+
+  if (leftFwd && !leftRev)      leftDir = 1;
+  else if (!leftFwd && leftRev) leftDir = -1;
+  else                          leftDir = 0;
+
+  if (rightFwd && !rightRev)      rightDir = 1;
+  else if (!rightFwd && rightRev) rightDir = -1;
+  else                            rightDir = 0;
+
+  setLeftTrack(leftDir);
+  setRightTrack(rightDir);
+
+  if (debugEnabled) {
+    Serial.print("MANUAL BUTTONS=0x");
+    if (p.buttons_bitmask < 16) Serial.print('0');
+    Serial.print(p.buttons_bitmask, HEX);
+    Serial.print(" LEFT=");
+    Serial.print(leftDir);
+    Serial.print(" RIGHT=");
+    Serial.println(rightDir);
+  }
+}
+
+// ===== AUTO continuous =====
+
+static void runAutoMode() {
+  if (millis() - lastAutoUpdateMs < AUTO_UPDATE_MS) {
+    return;
+  }
+
+  lastAutoUpdateMs = millis();
+
+  uint16_t l, c, r;
+  snapshotAndClearIrCounters(l, c, r);
+
+  lastAutoL = l;
+  lastAutoC = c;
+  lastAutoR = r;
+
+  int leftSpeed = 0;
+  int rightSpeed = 0;
+
+  const bool lost = (l <= IR_NONE_THRESHOLD) &&
+                    (c <= IR_NONE_THRESHOLD) &&
+                    (r <= IR_NONE_THRESHOLD);
+
+  if (lost) {
+    // brak sygnału -> wolny obrót w ostatnią znaną stronę
+    if (lastSeenDirection < 0) {
+      leftSpeed = -AUTO_SEARCH_SPEED_PWM;
+      rightSpeed = AUTO_SEARCH_SPEED_PWM;
+    } else {
+      leftSpeed = AUTO_SEARCH_SPEED_PWM;
+      rightSpeed = -AUTO_SEARCH_SPEED_PWM;
+    }
+  } else {
+    int error = (int)r - (int)l;
+
+    if (error > IR_SIDE_MARGIN) {
+      lastSeenDirection = 1;
+    } else if (error < -IR_SIDE_MARGIN) {
+      lastSeenDirection = -1;
+    }
+
+    int base = AUTO_BASE_SPEED_PWM;
+
+    // jeśli sygnał środkowy słabszy, jedź ostrożniej
+    if (c < IR_STRONG_THRESHOLD) {
+      base = AUTO_SLOW_SPEED_PWM;
+    }
+
+    // jeśli różnica boków duża, zwolnij bazę żeby najpierw się ustawić
+    if (abs(error) > 6) {
+      base = AUTO_SLOW_SPEED_PWM;
+    }
+
+    int turn = constrain(error * AUTO_TURN_GAIN, -AUTO_MAX_TURN_PWM, AUTO_MAX_TURN_PWM);
+
+    leftSpeed  = constrain(base + turn, -AUTO_MAX_SPEED_PWM, AUTO_MAX_SPEED_PWM);
+    rightSpeed = constrain(base - turn, -AUTO_MAX_SPEED_PWM, AUTO_MAX_SPEED_PWM);
+
+    // jeśli center nic nie widzi, a jeden bok widzi wyraźnie więcej, to bardziej obracaj niż jedź
+    if (c <= IR_NONE_THRESHOLD) {
+      if (r > l + IR_SIDE_MARGIN) {
+        leftSpeed = AUTO_SEARCH_SPEED_PWM;
+        rightSpeed = -AUTO_SEARCH_SPEED_PWM;
+      } else if (l > r + IR_SIDE_MARGIN) {
+        leftSpeed = -AUTO_SEARCH_SPEED_PWM;
+        rightSpeed = AUTO_SEARCH_SPEED_PWM;
+      }
+    }
+  }
+
+  setLeftTrackAuto(leftSpeed);
+  setRightTrackAuto(rightSpeed);
+
+  if (debugEnabled) {
+    Serial.print("AUTO IR L=");
+    Serial.print(l);
+    Serial.print(" C=");
+    Serial.print(c);
+    Serial.print(" R=");
+    Serial.print(r);
+    Serial.print(" -> LS=");
+    Serial.print(leftSpeed);
+    Serial.print(" RS=");
+    Serial.println(rightSpeed);
+  }
+}
+
+// ===== Serial/debug =====
 
 static void printStatus() {
-  Packet snapshot = desiredPacket;
-
   Serial.print("STATUS MODE=");
-  Serial.print(snapshot.mode == MODE_MANUAL ? "MANUAL" : "AUTO");
-  Serial.print(" BUTTONS=0x");
-  if (snapshot.buttons_bitmask < 16) Serial.print('0');
-  Serial.print(snapshot.buttons_bitmask, HEX);
-
-  Serial.print(" ACKED=");
-  Serial.print(haveAckedPacket ? "YES" : "NO");
-
-  if (haveAckedPacket) {
-    Serial.print(" LAST_ACK_MODE=");
-    Serial.print(lastAckedPacket.mode == MODE_MANUAL ? "MANUAL" : "AUTO");
-    Serial.print(" LAST_ACK_BUTTONS=0x");
-    if (lastAckedPacket.buttons_bitmask < 16) Serial.print('0');
-    Serial.print(lastAckedPacket.buttons_bitmask, HEX);
-  }
-
-  Serial.println();
+  Serial.print(currentMode == MODE_MANUAL ? "MANUAL" : "AUTO");
+  Serial.print(" LAST_BUTTONS=0x");
+  if (data.buttons_bitmask < 16) Serial.print('0');
+  Serial.print(data.buttons_bitmask, HEX);
+  Serial.print(" IR L=");
+  Serial.print(lastAutoL);
+  Serial.print(" C=");
+  Serial.print(lastAutoC);
+  Serial.print(" R=");
+  Serial.println(lastAutoR);
 }
 
 static void toUpperInPlace(char *s) {
@@ -185,16 +430,14 @@ static void handleSerialCommands() {
 }
 
 void setup() {
-  pinMode(PIN_MODE, INPUT_PULLUP);
-  pinMode(PIN_LEFT_FWD, INPUT_PULLUP);
-  pinMode(PIN_LEFT_REV, INPUT_PULLUP);
-  pinMode(PIN_RIGHT_FWD, INPUT_PULLUP);
-  pinMode(PIN_RIGHT_REV, INPUT_PULLUP);
-  pinMode(PIN_BTN_A1, INPUT_PULLUP);
-  pinMode(PIN_BTN_A2, INPUT_PULLUP);
+  pinMode(LEFT_IN1, OUTPUT);
+  pinMode(LEFT_IN2, OUTPUT);
+  pinMode(RIGHT_IN1, OUTPUT);
+  pinMode(RIGHT_IN2, OUTPUT);
 
-  pinMode(10, OUTPUT);
-  digitalWrite(10, HIGH);
+  stopMotors();
+  setupIrSensors();
+  resetIrCounters();
 
   Serial.begin(115200);
 
@@ -206,84 +449,54 @@ void setup() {
   radio.setPALevel(RF24_PA_MIN);
   radio.setDataRate(RF24_250KBPS);
   radio.setChannel(RADIO_CHANNEL);
-  radio.openWritingPipe(RADIO_ADDRESS);
-  radio.stopListening();
+  radio.openReadingPipe(1, RADIO_ADDRESS);
+  radio.startListening();
 
-  updateStateButtons();
-  buildDesiredPacket();
+  data.mode = MODE_MANUAL;
+  data.buttons_bitmask = 0;
 
-  const bool ok = radio.write(&desiredPacket, sizeof(desiredPacket));
-  haveAttemptedPacket = true;
-  lastAttemptedPacket = desiredPacket;
-  lastAttemptMs = millis();
+  lastAutoUpdateMs = millis();
 
-  if (ok) {
-    haveAckedPacket = true;
-    lastAckedPacket = desiredPacket;
-    lastAckMs = lastAttemptMs;
-  }
-
-  Serial.println("TX gotowy");
-  Serial.print("INIT TX=");
-  Serial.println(ok ? "OK" : "FAIL");
+  Serial.println("RX gotowy");
   Serial.println("DEBUG domyslnie OFF");
 }
 
 void loop() {
   handleSerialCommands();
 
-  if (debouncedPressed(modeBtn)) {
-    currentMode = (currentMode == MODE_MANUAL) ? MODE_AUTO : MODE_MANUAL;
-    if (debugEnabled) {
-      Serial.print("TRYB -> ");
-      Serial.println(currentMode == MODE_MANUAL ? "MANUAL" : "AUTO");
-    }
-  }
+  if (radio.available()) {
+    radio.read(&data, sizeof(data));
 
-  updateStateButtons();
-  buildDesiredPacket();
+    currentMode = data.mode;
 
-  const bool modePending = !haveAckedPacket || (desiredPacket.mode != lastAckedPacket.mode);
-  const bool buttonsPending = !haveAckedPacket || (desiredPacket.buttons_bitmask != lastAckedPacket.buttons_bitmask);
+    if (currentMode != lastMode) {
+      lastMode = currentMode;
 
-  bool shouldSend = false;
-  const char *reason = "";
-
-  if (modePending || buttonsPending) {
-    const bool newDesiredPacket = !haveAttemptedPacket || !packetEquals(desiredPacket, lastAttemptedPacket);
-    const unsigned long retryMs = modePending ? MODE_RETRY_MS : STATE_RETRY_MS;
-
-    if (newDesiredPacket || (millis() - lastAttemptMs >= retryMs)) {
-      shouldSend = true;
-      if (modePending && buttonsPending) {
-        reason = "MODE+CHANGE";
-      } else if (modePending) {
-        reason = "MODE";
+      if (currentMode == MODE_AUTO) {
+        resetIrCounters();
+        lastAutoUpdateMs = millis();
+        stopMotors();
       } else {
-        reason = "CHANGE";
+        stopMotors();
+      }
+
+      if (debugEnabled) {
+        Serial.print("TRYB -> ");
+        Serial.println(currentMode == MODE_MANUAL ? "MANUAL" : "AUTO");
       }
     }
-  } else if (currentMode == MODE_MANUAL && anyDriveButtons(desiredPacket.buttons_bitmask)) {
-    if (millis() - lastAckMs >= DRIVE_HEARTBEAT_MS) {
-      shouldSend = true;
-      reason = "HEARTBEAT";
+
+    if (currentMode == MODE_MANUAL) {
+      lastManualPacketTime = millis();
+      runManualMode(data);
     }
   }
 
-  if (shouldSend) {
-    const bool ok = radio.write(&desiredPacket, sizeof(desiredPacket));
-    haveAttemptedPacket = true;
-    lastAttemptedPacket = desiredPacket;
-    lastAttemptMs = millis();
-
-    if (ok) {
-      haveAckedPacket = true;
-      lastAckedPacket = desiredPacket;
-      lastAckMs = lastAttemptMs;
-    }
-
-    if (debugEnabled) {
-      printPacket("TX", desiredPacket, ok, reason);
+  if (currentMode == MODE_AUTO) {
+    runAutoMode();
+  } else {
+    if (millis() - lastManualPacketTime > SIGNAL_TIMEOUT) {
+      stopMotors();
     }
   }
 }
