@@ -14,7 +14,7 @@ At the current stage, the project is intended to support the following behavior:
 - IR beacon reception using three directional sensors
 - direction estimation based on left / center / right IR activity
 - autonomous correction of movement toward the IR beacon
-- autonomous operation with either PWM-based or binary ON/OFF drive output behavior
+- autonomous operation with binary ON/OFF track drive control
 
 ## System Architecture
 
@@ -226,4 +226,3 @@ For firmware that exposes UART diagnostics:
 ```bash
 pio device monitor -b 115200
 ```
-

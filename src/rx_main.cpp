@@ -7,49 +7,43 @@
 
 #include "protocol.h"
 
-const int LEFT_IN1  = 6;
-const int LEFT_IN2  = 5;
+const int LEFT_IN1 = 6;
+const int LEFT_IN2 = 5;
 const int RIGHT_IN1 = 10;
 const int RIGHT_IN2 = 9;
 
-const byte CE_PIN  = 7;
+const byte CE_PIN = 7;
 const byte CSN_PIN = 8;
 
 // ===== IR sensors =====
-// faktyczne przypisanie:
-const byte IR_LEFT_PIN   = 2;   // D2 = PD2
-const byte IR_RIGHT_PIN  = 3;   // D3 = PD3
-const byte IR_CENTER_PIN = 4;   // D4 = PD4
+const byte IR_LEFT_PIN = 2;    // D2 = PD2
+const byte IR_RIGHT_PIN = 3;   // D3 = PD3
+const byte IR_CENTER_PIN = 4;  // D4 = PD4
 
 const unsigned long IR_DEBOUNCE_US = 300;
 
 // ===== AUTO config =====
-static constexpr bool AUTO_USE_PWM = false;   // <-- zmień na false, aby AUTO było bez PWM
-
 const unsigned long AUTO_UPDATE_MS = 100;
 
-const uint16_t IR_NONE_THRESHOLD   = 2;
+const uint16_t IR_NONE_THRESHOLD = 2;
 const uint16_t IR_STRONG_THRESHOLD = 15;
-const int IR_SIDE_MARGIN           = 4;
+const int IR_SIDE_MARGIN = 4;
 
-// PWM / continuous steering tuning
-const int AUTO_BASE_SPEED_PWM      = 85;
-const int AUTO_SLOW_SPEED_PWM      = 60;
-const int AUTO_SEARCH_SPEED_PWM    = 70;
-const int AUTO_MAX_SPEED_PWM       = 140;
-const int AUTO_TURN_GAIN           = 10;
-const int AUTO_MAX_TURN_PWM        = 90;
+const int AUTO_BASE_SPEED = 85;
+const int AUTO_SLOW_SPEED = 60;
+const int AUTO_SEARCH_SPEED = 70;
+const int AUTO_MAX_SPEED = 140;
+const int AUTO_TURN_GAIN = 10;
+const int AUTO_MAX_TURN = 90;
+const int AUTO_DRIVE_THRESHOLD = 10;
 
-// non-PWM fallback still uses same logic, but outputs full ON/OFF
-const int AUTO_BINARY_THRESHOLD    = 10;
-
-volatile uint16_t irHitsLeft   = 0;
+volatile uint16_t irHitsLeft = 0;
 volatile uint16_t irHitsCenter = 0;
-volatile uint16_t irHitsRight  = 0;
+volatile uint16_t irHitsRight = 0;
 
-volatile unsigned long irLastEdgeLeftUs   = 0;
+volatile unsigned long irLastEdgeLeftUs = 0;
 volatile unsigned long irLastEdgeCenterUs = 0;
-volatile unsigned long irLastEdgeRightUs  = 0;
+volatile unsigned long irLastEdgeRightUs = 0;
 
 volatile uint8_t lastPortDState = 0;
 
@@ -70,7 +64,7 @@ uint8_t serialLen = 0;
 
 // ===== AUTO state =====
 unsigned long lastAutoUpdateMs = 0;
-int8_t lastSeenDirection = 1;   // -1 = lewo, +1 = prawo
+int8_t lastSeenDirection = 1;  // -1 = left, +1 = right
 uint16_t lastAutoL = 0;
 uint16_t lastAutoC = 0;
 uint16_t lastAutoR = 0;
@@ -106,7 +100,7 @@ static void setupIrSensors() {
 
   lastPortDState = PIND;
 
-  // Pin Change Interrupt dla portu D
+  // Pin Change Interrupt for port D.
   PCICR |= _BV(PCIE2);
 
   // D2, D3, D4 -> PCINT18, PCINT19, PCINT20
@@ -123,7 +117,6 @@ ISR(PCINT2_vect) {
 
   unsigned long nowUs = micros();
 
-  // LEFT = D2 = PD2
   if (falling & _BV(PD2)) {
     if (nowUs - irLastEdgeLeftUs > IR_DEBOUNCE_US) {
       irHitsLeft++;
@@ -131,7 +124,6 @@ ISR(PCINT2_vect) {
     }
   }
 
-  // RIGHT = D3 = PD3
   if (falling & _BV(PD3)) {
     if (nowUs - irLastEdgeRightUs > IR_DEBOUNCE_US) {
       irHitsRight++;
@@ -139,7 +131,6 @@ ISR(PCINT2_vect) {
     }
   }
 
-  // CENTER = D4 = PD4
   if (falling & _BV(PD4)) {
     if (nowUs - irLastEdgeCenterUs > IR_DEBOUNCE_US) {
       irHitsCenter++;
@@ -150,7 +141,6 @@ ISR(PCINT2_vect) {
 
 // ===== Motor helpers =====
 
-// binary/manual
 static void setLeftTrack(int dir) {
   if (dir > 0) {
     digitalWrite(LEFT_IN1, HIGH);
@@ -178,11 +168,6 @@ static void setRightTrack(int dir) {
 }
 
 static void stopMotors() {
-  analogWrite(LEFT_IN1, 0);
-  analogWrite(LEFT_IN2, 0);
-  analogWrite(RIGHT_IN1, 0);
-  analogWrite(RIGHT_IN2, 0);
-
   digitalWrite(LEFT_IN1, LOW);
   digitalWrite(LEFT_IN2, LOW);
   digitalWrite(RIGHT_IN1, LOW);
@@ -192,26 +177,12 @@ static void stopMotors() {
 static void setLeftTrackAuto(int speedVal) {
   speedVal = constrain(speedVal, -255, 255);
 
-  if (!AUTO_USE_PWM) {
-    if (speedVal > AUTO_BINARY_THRESHOLD) {
-      digitalWrite(LEFT_IN1, HIGH);
-      digitalWrite(LEFT_IN2, LOW);
-    } else if (speedVal < -AUTO_BINARY_THRESHOLD) {
-      digitalWrite(LEFT_IN1, LOW);
-      digitalWrite(LEFT_IN2, HIGH);
-    } else {
-      digitalWrite(LEFT_IN1, LOW);
-      digitalWrite(LEFT_IN2, LOW);
-    }
-    return;
-  }
-
-  if (speedVal > 0) {
-    analogWrite(LEFT_IN1, speedVal);
+  if (speedVal > AUTO_DRIVE_THRESHOLD) {
+    digitalWrite(LEFT_IN1, HIGH);
     digitalWrite(LEFT_IN2, LOW);
-  } else if (speedVal < 0) {
+  } else if (speedVal < -AUTO_DRIVE_THRESHOLD) {
     digitalWrite(LEFT_IN1, LOW);
-    analogWrite(LEFT_IN2, -speedVal);
+    digitalWrite(LEFT_IN2, HIGH);
   } else {
     digitalWrite(LEFT_IN1, LOW);
     digitalWrite(LEFT_IN2, LOW);
@@ -221,26 +192,12 @@ static void setLeftTrackAuto(int speedVal) {
 static void setRightTrackAuto(int speedVal) {
   speedVal = constrain(speedVal, -255, 255);
 
-  if (!AUTO_USE_PWM) {
-    if (speedVal > AUTO_BINARY_THRESHOLD) {
-      digitalWrite(RIGHT_IN1, HIGH);
-      digitalWrite(RIGHT_IN2, LOW);
-    } else if (speedVal < -AUTO_BINARY_THRESHOLD) {
-      digitalWrite(RIGHT_IN1, LOW);
-      digitalWrite(RIGHT_IN2, HIGH);
-    } else {
-      digitalWrite(RIGHT_IN1, LOW);
-      digitalWrite(RIGHT_IN2, LOW);
-    }
-    return;
-  }
-
-  if (speedVal > 0) {
-    analogWrite(RIGHT_IN1, speedVal);
+  if (speedVal > AUTO_DRIVE_THRESHOLD) {
+    digitalWrite(RIGHT_IN1, HIGH);
     digitalWrite(RIGHT_IN2, LOW);
-  } else if (speedVal < 0) {
+  } else if (speedVal < -AUTO_DRIVE_THRESHOLD) {
     digitalWrite(RIGHT_IN1, LOW);
-    analogWrite(RIGHT_IN2, -speedVal);
+    digitalWrite(RIGHT_IN2, HIGH);
   } else {
     digitalWrite(RIGHT_IN1, LOW);
     digitalWrite(RIGHT_IN2, LOW);
@@ -250,21 +207,19 @@ static void setRightTrackAuto(int speedVal) {
 // ===== MANUAL =====
 
 static void runManualMode(const Packet &p) {
-  const bool leftFwd  = (p.buttons_bitmask & BTN_MASK_LEFT_FWD)  != 0;
-  const bool leftRev  = (p.buttons_bitmask & BTN_MASK_LEFT_REV)  != 0;
+  const bool leftFwd = (p.buttons_bitmask & BTN_MASK_LEFT_FWD) != 0;
+  const bool leftRev = (p.buttons_bitmask & BTN_MASK_LEFT_REV) != 0;
   const bool rightFwd = (p.buttons_bitmask & BTN_MASK_RIGHT_FWD) != 0;
   const bool rightRev = (p.buttons_bitmask & BTN_MASK_RIGHT_REV) != 0;
 
   int leftDir = 0;
   int rightDir = 0;
 
-  if (leftFwd && !leftRev)      leftDir = 1;
+  if (leftFwd && !leftRev) leftDir = 1;
   else if (!leftFwd && leftRev) leftDir = -1;
-  else                          leftDir = 0;
 
-  if (rightFwd && !rightRev)      rightDir = 1;
+  if (rightFwd && !rightRev) rightDir = 1;
   else if (!rightFwd && rightRev) rightDir = -1;
-  else                            rightDir = 0;
 
   setLeftTrack(leftDir);
   setRightTrack(rightDir);
@@ -280,7 +235,7 @@ static void runManualMode(const Packet &p) {
   }
 }
 
-// ===== AUTO continuous =====
+// ===== AUTO =====
 
 static void runAutoMode() {
   if (millis() - lastAutoUpdateMs < AUTO_UPDATE_MS) {
@@ -304,13 +259,12 @@ static void runAutoMode() {
                     (r <= IR_NONE_THRESHOLD);
 
   if (lost) {
-    // brak sygnału -> wolny obrót w ostatnią znaną stronę
     if (lastSeenDirection < 0) {
-      leftSpeed = -AUTO_SEARCH_SPEED_PWM;
-      rightSpeed = AUTO_SEARCH_SPEED_PWM;
+      leftSpeed = -AUTO_SEARCH_SPEED;
+      rightSpeed = AUTO_SEARCH_SPEED;
     } else {
-      leftSpeed = AUTO_SEARCH_SPEED_PWM;
-      rightSpeed = -AUTO_SEARCH_SPEED_PWM;
+      leftSpeed = AUTO_SEARCH_SPEED;
+      rightSpeed = -AUTO_SEARCH_SPEED;
     }
   } else {
     int error = (int)r - (int)l;
@@ -321,31 +275,28 @@ static void runAutoMode() {
       lastSeenDirection = -1;
     }
 
-    int base = AUTO_BASE_SPEED_PWM;
+    int base = AUTO_BASE_SPEED;
 
-    // jeśli sygnał środkowy słabszy, jedź ostrożniej
     if (c < IR_STRONG_THRESHOLD) {
-      base = AUTO_SLOW_SPEED_PWM;
+      base = AUTO_SLOW_SPEED;
     }
 
-    // jeśli różnica boków duża, zwolnij bazę żeby najpierw się ustawić
     if (abs(error) > 6) {
-      base = AUTO_SLOW_SPEED_PWM;
+      base = AUTO_SLOW_SPEED;
     }
 
-    int turn = constrain(error * AUTO_TURN_GAIN, -AUTO_MAX_TURN_PWM, AUTO_MAX_TURN_PWM);
+    int turn = constrain(error * AUTO_TURN_GAIN, -AUTO_MAX_TURN, AUTO_MAX_TURN);
 
-    leftSpeed  = constrain(base + turn, -AUTO_MAX_SPEED_PWM, AUTO_MAX_SPEED_PWM);
-    rightSpeed = constrain(base - turn, -AUTO_MAX_SPEED_PWM, AUTO_MAX_SPEED_PWM);
+    leftSpeed = constrain(base + turn, -AUTO_MAX_SPEED, AUTO_MAX_SPEED);
+    rightSpeed = constrain(base - turn, -AUTO_MAX_SPEED, AUTO_MAX_SPEED);
 
-    // jeśli center nic nie widzi, a jeden bok widzi wyraźnie więcej, to bardziej obracaj niż jedź
     if (c <= IR_NONE_THRESHOLD) {
       if (r > l + IR_SIDE_MARGIN) {
-        leftSpeed = AUTO_SEARCH_SPEED_PWM;
-        rightSpeed = -AUTO_SEARCH_SPEED_PWM;
+        leftSpeed = AUTO_SEARCH_SPEED;
+        rightSpeed = -AUTO_SEARCH_SPEED;
       } else if (l > r + IR_SIDE_MARGIN) {
-        leftSpeed = -AUTO_SEARCH_SPEED_PWM;
-        rightSpeed = AUTO_SEARCH_SPEED_PWM;
+        leftSpeed = -AUTO_SEARCH_SPEED;
+        rightSpeed = AUTO_SEARCH_SPEED;
       }
     }
   }
@@ -494,9 +445,7 @@ void loop() {
 
   if (currentMode == MODE_AUTO) {
     runAutoMode();
-  } else {
-    if (millis() - lastManualPacketTime > SIGNAL_TIMEOUT) {
-      stopMotors();
-    }
+  } else if (millis() - lastManualPacketTime > SIGNAL_TIMEOUT) {
+    stopMotors();
   }
 }
