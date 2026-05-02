@@ -1,0 +1,135 @@
+# PlatformIO project: TX/RX for nRF24 `CTRL1`
+
+Ten projekt zawiera dwa firmware'y:
+
+- `tx_main.cpp` — nowy nadajnik/kontroler z **7 przyciskami** i pakietem `{mode, buttons_bitmask}`
+- `rx_main.cpp` — odbiornik na robocie z **manualnym sterowaniem gąsienicami bez PWM**
+
+## Protokół radiowy
+
+Adres radia: `CTRL1`
+
+Kanał: `76`
+
+Data rate: `RF24_250KBPS`
+
+PA level: `RF24_PA_MIN`
+
+### Packet
+
+```cpp
+struct Packet {
+  uint8_t mode;
+  uint8_t buttons_bitmask;
+};
+```
+
+### `mode`
+
+- `0` = `MODE_MANUAL`
+- `1` = `MODE_AUTO`
+
+### `buttons_bitmask`
+
+- bit 0 = `LEFT_FWD`
+- bit 1 = `LEFT_REV`
+- bit 2 = `RIGHT_FWD`
+- bit 3 = `RIGHT_REV`
+- bit 4 = `A1`
+- bit 5 = `A2`
+
+## TX pinout (nowy kontroler / PCB)
+
+### Przyciski
+
+- `D2` = `MODE` (toggle MANUAL/AUTO)
+- `D3` = `LEFT_FWD`
+- `D4` = `LEFT_REV`
+- `D5` = `RIGHT_FWD`
+- `D6` = `RIGHT_REV`
+- `D7` = `A1`
+- `D8` = `A2`
+
+Każdy przycisk: **pin -> przycisk -> GND**, w kodzie jest `INPUT_PULLUP`.
+
+### nRF24
+
+- `D9`  = `CE`
+- `D10` = `CSN`
+- `D11` = `MOSI`
+- `D12` = `MISO`
+- `D13` = `SCK`
+
+## RX pinout (obecny robot)
+
+### nRF24
+
+- `D7`  = `CE`
+- `D8`  = `CSN`
+- `D11` = `MOSI`
+- `D12` = `MISO`
+- `D13` = `SCK`
+
+### Silniki
+
+- `LEFT_IN1`  = `D6`
+- `LEFT_IN2`  = `D5`
+- `RIGHT_IN1` = `D10`
+- `RIGHT_IN2` = `D9`
+
+## Upload / build
+
+### Testy na UNO jako TX
+
+```bash
+pio run -e tx_uno
+pio run -e tx_uno -t upload
+pio device monitor -b 115200
+```
+
+### Docelowa ATmega328P z bootloaderem po UART
+
+Edytuj w `platformio.ini`:
+
+- `upload_port = COM7` -> ustaw swój port
+- jeśli bootloader nie działa przy `115200`, zmień `upload_speed` np. na `57600`
+
+```bash
+pio run -e tx_atmega328p_uart
+pio run -e tx_atmega328p_uart -t upload
+pio device monitor -b 115200
+```
+
+### Odbiornik Nano
+
+```bash
+pio run -e rx_nano
+pio run -e rx_nano -t upload
+pio device monitor -b 115200
+```
+
+## Serial commands
+
+Na TX i RX:
+
+- `DEBUG ON`
+- `DEBUG OFF`
+- `DEBUG`
+- `STATUS`
+- `HELP`
+
+## Logika nadawania
+
+### TX
+
+- pakiet jest wysyłany przy zmianie `mode` lub `buttons_bitmask`
+- gdy w `MANUAL` trzymasz przyciski jazdy, idzie rzadki heartbeat
+- gdy nic nie wciskasz, TX nie spamuje pakietami
+- w `AUTO` nie ma heartbeatów joysticka/przycisków jazdy
+
+### RX
+
+- w `MANUAL` 4 bity jazdy sterują dwiema gąsienicami bez PWM
+- jeśli dla jednej gąsienicy są wciśnięte jednocześnie `FWD` i `REV`, ta gąsienica stoi
+- w `AUTO` robot na razie stoi (`runAutoPlaceholder()`)
+- timeout w `MANUAL` zatrzymuje silniki po utracie sygnału

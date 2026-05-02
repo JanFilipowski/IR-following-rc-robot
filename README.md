@@ -1,21 +1,121 @@
-# PlatformIO project: TX/RX for nRF24 `CTRL1`
+# Robot Remote Control PlatformIO Project
 
-Ten projekt zawiera dwa firmware'y:
+## Project Overview
 
-- `tx_main.cpp` — nowy nadajnik/kontroler z **7 przyciskami** i pakietem `{mode, buttons_bitmask}`
-- `rx_main.cpp` — odbiornik na robocie z **manualnym sterowaniem gąsienicami bez PWM**
+This project implements a three-part control system for a small tracked robot built around  ATmega328P microcontrollers and the nRF24L01+ radio module family. The system is split into a handheld RF transmitter, a robot-side RF receiver with motor control and autonomous IR tracking logic, and a separate IR beacon transmitter that generates a 38 kHz carrier in repeated bursts.
 
-## Protokół radiowy
+The codebase is organized as a single PlatformIO project with separate firmware entrypoints for each microcontroller. This makes it possible to build and upload the controller, the robot receiver, and the IR transmitter independently while keeping the radio protocol and overall project structure in one repository.
 
-Adres radia: `CTRL1`
+## Current Functional State
 
-Kanał: `76`
+At the current stage, the project is intended to support the following behavior:
+- manual radio control of a tracked robot platform
+- switching between manual and autonomous operation
+- IR beacon reception using three directional sensors
+- direction estimation based on left / center / right IR activity
+- autonomous correction of movement toward the IR beacon
+- autonomous operation with either PWM-based or binary ON/OFF drive output behavior
 
-Data rate: `RF24_250KBPS`
+## System Architecture
 
-PA level: `RF24_PA_MIN`
+The robot control stack is composed of:
 
-### Packet
+- a transmitter / handheld controller based on an ATmega328P or other Arduino-compatible MCU
+- a robot-side receiver based on Arduino Nano
+- a differential-drive tracked platform
+- a separate IR beacon transmitter
+- manual and autonomous operating modes
+
+## Firmware Variants
+
+This repository currently contains three firmware variants:
+
+- `src/tx_main.cpp`: RF handheld controller firmware
+- `src/rx_main.cpp`: robot-side RF receiver, motor controller, and IR-guided autonomous logic
+- `src/ir_main.cpp`: standalone 38 kHz IR beacon transmitter
+
+## Functional Description
+
+### Manual Mode
+
+In manual mode, the robot is controlled remotely over the nRF24L01+ radio link.
+
+The controller uses a button-based interface rather than an analog joystick. The available controls are:
+
+- left track forward
+- left track reverse
+- right track forward
+- right track reverse
+- MANUAL/AUTO mode toggle
+- action button `A1`
+- action button `A2`
+
+The left and right tracks are controlled independently, which allows:
+
+- forward motion
+- reverse motion
+- in-place rotation
+- turning by asymmetric track control
+
+At the radio protocol level, the transmitter sends:
+
+- the current operating mode: `MANUAL` or `AUTO`
+- a bitmask of the currently pressed buttons
+
+### Autonomous Mode
+
+In `AUTO` mode, the robot ignores manual drive commands and relies on local IR beacon tracking logic running on the receiver MCU.
+
+The robot uses three front-mounted IR receivers:
+
+- left
+- center
+- right
+
+Based on the number of detected IR bursts inside a time window, the robot estimates the direction of the IR source and chooses a movement decision such as:
+
+- rotate left
+- rotate right
+- move forward
+- search for the signal after losing contact
+
+The autonomous guidance logic is based on:
+
+- comparing `LEFT`, `CENTER`, and `RIGHT` sensor activity
+- remembering the last direction from which the beacon was detected
+- continuously correcting the motion direction while tracking the beacon
+
+
+## Diagnostics and Debugging
+
+Both the transmitter and receiver support basic diagnostic commands over UART / Serial:
+
+- `DEBUG ON`
+- `DEBUG OFF`
+- `DEBUG`
+- `STATUS`
+- `HELP`
+
+These commands can be used to inspect:
+
+- the current operating mode
+- the button state seen by the transmitter
+- radio communication behavior
+- IR sensor activity
+- autonomous tracking decisions
+
+## Radio Protocol
+
+The shared radio protocol is defined in `include/protocol.h`.
+
+Current radio settings:
+
+- address: `CTRL1`
+- channel: `76`
+- data rate: `RF24_250KBPS`
+- PA level: `RF24_PA_MIN`
+
+Packet format:
 
 ```cpp
 struct Packet {
@@ -38,98 +138,92 @@ struct Packet {
 - bit 4 = `A1`
 - bit 5 = `A2`
 
-## TX pinout (nowy kontroler / PCB)
+## Pinout
 
-### Przyciski
+### Transmitter (`tx_main.cpp`)
 
-- `D2` = `MODE` (toggle MANUAL/AUTO)
-- `D3` = `LEFT_FWD`
-- `D4` = `LEFT_REV`
-- `D5` = `RIGHT_FWD`
+Buttons:
+
+- `D2` = `MODE`
+- `D3` = `A1`
+- `D4` = `A2`
+- `D5` = `LEFT_REV`
 - `D6` = `RIGHT_REV`
-- `D7` = `A1`
-- `D8` = `A2`
+- `D7` = `RIGHT_FWD`
+- `D8` = `LEFT_FWD`
 
-Każdy przycisk: **pin -> przycisk -> GND**, w kodzie jest `INPUT_PULLUP`.
+Each button is wired as `pin -> button -> GND`, with `INPUT_PULLUP` enabled in firmware.
 
-### nRF24
+nRF24L01+:
 
-- `D9`  = `CE`
+- `D9` = `CE`
 - `D10` = `CSN`
 - `D11` = `MOSI`
 - `D12` = `MISO`
 - `D13` = `SCK`
 
-## RX pinout (obecny robot)
+### Receiver (`rx_main.cpp`)
 
-### nRF24
+nRF24L01+:
 
-- `D7`  = `CE`
-- `D8`  = `CSN`
+- `D7` = `CE`
+- `D8` = `CSN`
 - `D11` = `MOSI`
 - `D12` = `MISO`
 - `D13` = `SCK`
 
-### Silniki
+Motor outputs:
 
-- `LEFT_IN1`  = `D6`
-- `LEFT_IN2`  = `D5`
-- `RIGHT_IN1` = `D10`
-- `RIGHT_IN2` = `D9`
+- `D6` = `LEFT_IN1`
+- `D5` = `LEFT_IN2`
+- `D10` = `RIGHT_IN1`
+- `D9` = `RIGHT_IN2`
 
-## Upload / build
+IR receivers:
 
-### Testy na UNO jako TX
+- `D2` = `IR_LEFT`
+- `D3` = `IR_RIGHT`
+- `D4` = `IR_CENTER`
 
-```bash
-pio run -e tx_uno
-pio run -e tx_uno -t upload
-pio device monitor -b 115200
-```
+### IR Beacon Transmitter (`ir_main.cpp`)
 
-### Docelowa ATmega328P z bootloaderem po UART
+IR output:
 
-Edytuj w `platformio.ini`:
+- `D9` = 38 kHz carrier output (`OC1A`)
 
-- `upload_port = COM7` -> ustaw swój port
-- jeśli bootloader nie działa przy `115200`, zmień `upload_speed` np. na `57600`
+The IR transmitter firmware configures Timer1 for approximately 38 kHz PWM and alternates between carrier bursts and silent gaps.
+
+## Build and Upload with PlatformIO
+
+The project is configured as a multi-environment PlatformIO workspace. Each environment builds exactly one firmware entrypoint.
+
+Available environments:
+
+- `tx_atmega328p_uart`: transmitter firmware for a standalone ATmega328P with Arduino-compatible UART bootloader
+- `rx_nano`: receiver firmware for Arduino Nano
+- `ir_atmega328p_uart`: IR beacon transmitter firmware for a standalone ATmega328P with Arduino-compatible UART bootloader
+
+### Build Commands
 
 ```bash
 pio run -e tx_atmega328p_uart
-pio run -e tx_atmega328p_uart -t upload
-pio device monitor -b 115200
+pio run -e rx_nano
+pio run -e ir_atmega328p_uart
 ```
 
-### Odbiornik Nano
+### Upload Commands
 
 ```bash
-pio run -e rx_nano
+pio run -e tx_atmega328p_uart -t upload
 pio run -e rx_nano -t upload
+pio run -e ir_atmega328p_uart -t upload
+```
+
+### Serial Monitor
+
+For firmware that exposes UART diagnostics:
+
+```bash
 pio device monitor -b 115200
 ```
 
-## Serial commands
-
-Na TX i RX:
-
-- `DEBUG ON`
-- `DEBUG OFF`
-- `DEBUG`
-- `STATUS`
-- `HELP`
-
-## Logika nadawania
-
-### TX
-
-- pakiet jest wysyłany przy zmianie `mode` lub `buttons_bitmask`
-- gdy w `MANUAL` trzymasz przyciski jazdy, idzie rzadki heartbeat
-- gdy nic nie wciskasz, TX nie spamuje pakietami
-- w `AUTO` nie ma heartbeatów joysticka/przycisków jazdy
-
-### RX
-
-- w `MANUAL` 4 bity jazdy sterują dwiema gąsienicami bez PWM
-- jeśli dla jednej gąsienicy są wciśnięte jednocześnie `FWD` i `REV`, ta gąsienica stoi
-- w `AUTO` robot na razie stoi (`runAutoPlaceholder()`)
-- timeout w `MANUAL` zatrzymuje silniki po utracie sygnału
