@@ -3,230 +3,300 @@
 #include <RF24.h>
 #include <ctype.h>
 #include <string.h>
-#include <avr/interrupt.h>
 
 #include "protocol.h"
 
-const int LEFT_IN1 = 6;
-const int LEFT_IN2 = 5;
-const int RIGHT_IN1 = 10;
-const int RIGHT_IN2 = 9;
+// ===== L298N =====
+// Zgodnie z Twoim schematem:
+// IN1, IN2, IN3, IN4 -> Arduino 7, 6, 5, 4
+const int LEFT_IN1  = 5;
+const int LEFT_IN2  = 4;
+const int RIGHT_IN1 = 3;
+const int RIGHT_IN2 = 2;
 
-const byte CE_PIN = 7;
-const byte CSN_PIN = 8;
+// ===== RADIO =====
+// nRF24L01
+const byte CE_PIN  = 9;
+const byte CSN_PIN = 10;
 
-// ===== IR sensors =====
-const byte IR_LEFT_PIN = 2;    // D2 = PD2
-const byte IR_RIGHT_PIN = 3;   // D3 = PD3
-const byte IR_CENTER_PIN = 4;  // D4 = PD4
+// ===== BUZZER =====
+const int BUZZER = 14;
 
-const unsigned long IR_DEBOUNCE_US = 300;
-
-// ===== AUTO config =====
-const unsigned long AUTO_UPDATE_MS = 100;
-
-const uint16_t IR_NONE_THRESHOLD = 2;
-const uint16_t IR_STRONG_THRESHOLD = 15;
-const int IR_SIDE_MARGIN = 4;
-
-const int AUTO_BASE_SPEED = 85;
-const int AUTO_SLOW_SPEED = 60;
-const int AUTO_SEARCH_SPEED = 70;
-const int AUTO_MAX_SPEED = 140;
-const int AUTO_TURN_GAIN = 10;
-const int AUTO_MAX_TURN = 90;
-const int AUTO_DRIVE_THRESHOLD = 10;
-
-volatile uint16_t irHitsLeft = 0;
-volatile uint16_t irHitsCenter = 0;
-volatile uint16_t irHitsRight = 0;
-
-volatile unsigned long irLastEdgeLeftUs = 0;
-volatile unsigned long irLastEdgeCenterUs = 0;
-volatile unsigned long irLastEdgeRightUs = 0;
-
-volatile uint8_t lastPortDState = 0;
-
+// ===== RADIO =====
 RF24 radio(CE_PIN, CSN_PIN);
-
 Packet data;
 
+// ===== TRYB =====
 uint8_t currentMode = MODE_MANUAL;
 uint8_t lastMode = 255;
 
-unsigned long lastManualPacketTime = 0;
+// ===== FAILSAFE =====
+unsigned long lastPacketTime = 0;
 const unsigned long SIGNAL_TIMEOUT = 300;
 
+// ===== DEBUG SERIAL =====
 bool debugEnabled = false;
+unsigned long lastNoPacketDebugTime = 0;
 
 char serialBuf[32];
 uint8_t serialLen = 0;
 
-// ===== AUTO state =====
-unsigned long lastAutoUpdateMs = 0;
-int8_t lastSeenDirection = 1;  // -1 = left, +1 = right
-uint16_t lastAutoL = 0;
-uint16_t lastAutoC = 0;
-uint16_t lastAutoR = 0;
+// ===== STAN GĄSIENIC =====
+// -1 = tył, 0 = stop, 1 = przód
+int currentLeftDir = 0;
+int currentRightDir = 0;
 
-// ===== IR helpers =====
+// ===== PRZYCISKI =====
+uint8_t lastButtonsMask = 0;
 
-static void resetIrCounters() {
-  noInterrupts();
-  irHitsLeft = 0;
-  irHitsCenter = 0;
-  irHitsRight = 0;
-  irLastEdgeLeftUs = 0;
-  irLastEdgeCenterUs = 0;
-  irLastEdgeRightUs = 0;
-  interrupts();
-}
+// ===== NUTY DO VALKYRIE / WAGNER =====
+#define NOTE_FS3 185
+#define NOTE_A3  220
+#define NOTE_B3  247
+#define NOTE_CS4 277
+#define NOTE_D4  294
+#define NOTE_FS4 370
+#define NOTE_A4  440
+#define NOTE_CS5 554
 
-static void snapshotAndClearIrCounters(uint16_t &l, uint16_t &c, uint16_t &r) {
-  noInterrupts();
-  l = irHitsLeft;
-  c = irHitsCenter;
-  r = irHitsRight;
-  irHitsLeft = 0;
-  irHitsCenter = 0;
-  irHitsRight = 0;
-  interrupts();
-}
+const int wagnerMelody[] = {
+  NOTE_B3, NOTE_FS3, NOTE_B3, NOTE_D4, NOTE_B3, NOTE_D4, NOTE_B3, NOTE_D4, NOTE_FS4,
+  NOTE_D4, NOTE_FS4, NOTE_D4, NOTE_FS4, NOTE_A4, NOTE_A3, NOTE_D4, NOTE_A3, NOTE_D4,
+  NOTE_FS4, NOTE_B3, NOTE_D4, NOTE_B3, NOTE_D4, NOTE_FS4, NOTE_D4, NOTE_FS4, NOTE_D4,
+  NOTE_FS4, NOTE_A4, NOTE_FS4, NOTE_A4, NOTE_FS4, NOTE_A4, NOTE_CS5, NOTE_CS4, NOTE_FS4,
+  NOTE_CS4, NOTE_FS4, NOTE_A4
+};
 
-static void setupIrSensors() {
-  pinMode(IR_LEFT_PIN, INPUT);
-  pinMode(IR_CENTER_PIN, INPUT);
-  pinMode(IR_RIGHT_PIN, INPUT);
+const float wagnerDurations[] = {
+  4, 8, 4, 1.34, 1.34, 4, 8, 4, 1.34, 1.34,
+  4, 8, 4, 1.34, 1.34, 4, 8, 4, 0.83, 4,
+  4, 8, 4, 1.34, 1.34, 4, 8, 4, 1.34, 1.34,
+  4, 8, 4, 1.34, 1.34, 4, 8, 4, 0.30
+};
 
-  lastPortDState = PIND;
+const int WAGNER_BPM = 84;
+const int WAGNER_LEN = sizeof(wagnerMelody) / sizeof(wagnerMelody[0]);
 
-  // Pin Change Interrupt for port D.
-  PCICR |= _BV(PCIE2);
+bool wagnerEnabled = false;
+bool wagnerPlaying = false;
+int wagnerIndex = 0;
+bool wagnerTonePhase = false;
+unsigned long wagnerStepStart = 0;
 
-  // D2, D3, D4 -> PCINT18, PCINT19, PCINT20
-  PCMSK2 |= _BV(PCINT18);
-  PCMSK2 |= _BV(PCINT19);
-  PCMSK2 |= _BV(PCINT20);
-}
+// ===== BEEP COFANIA =====
+unsigned long lastBeepTime = 0;
+bool beepOn = false;
 
-ISR(PCINT2_vect) {
-  uint8_t nowState = PIND;
-  uint8_t changed = nowState ^ lastPortDState;
-  uint8_t falling = changed & lastPortDState & (~nowState);
-  lastPortDState = nowState;
+// =====================================================
+// SILNIKI
+// =====================================================
 
-  unsigned long nowUs = micros();
-
-  if (falling & _BV(PD2)) {
-    if (nowUs - irLastEdgeLeftUs > IR_DEBOUNCE_US) {
-      irHitsLeft++;
-      irLastEdgeLeftUs = nowUs;
-    }
-  }
-
-  if (falling & _BV(PD3)) {
-    if (nowUs - irLastEdgeRightUs > IR_DEBOUNCE_US) {
-      irHitsRight++;
-      irLastEdgeRightUs = nowUs;
-    }
-  }
-
-  if (falling & _BV(PD4)) {
-    if (nowUs - irLastEdgeCenterUs > IR_DEBOUNCE_US) {
-      irHitsCenter++;
-      irLastEdgeCenterUs = nowUs;
-    }
-  }
-}
-
-// ===== Motor helpers =====
-
-static void setLeftTrack(int dir) {
+// Zgodnie ze schematem binarnym:
+// 01 = przód
+// 10 = tył
+// 00 = stop
+static void setTrackPins(int pin1, int pin2, int dir) {
   if (dir > 0) {
-    digitalWrite(LEFT_IN1, HIGH);
-    digitalWrite(LEFT_IN2, LOW);
+    // 01 = przód
+    digitalWrite(pin1, LOW);
+    digitalWrite(pin2, HIGH);
   } else if (dir < 0) {
-    digitalWrite(LEFT_IN1, LOW);
-    digitalWrite(LEFT_IN2, HIGH);
+    // 10 = tył
+    digitalWrite(pin1, HIGH);
+    digitalWrite(pin2, LOW);
   } else {
-    digitalWrite(LEFT_IN1, LOW);
-    digitalWrite(LEFT_IN2, LOW);
+    // 00 = stop
+    digitalWrite(pin1, LOW);
+    digitalWrite(pin2, LOW);
   }
 }
 
-static void setRightTrack(int dir) {
-  if (dir > 0) {
-    digitalWrite(RIGHT_IN1, HIGH);
-    digitalWrite(RIGHT_IN2, LOW);
-  } else if (dir < 0) {
-    digitalWrite(RIGHT_IN1, LOW);
-    digitalWrite(RIGHT_IN2, HIGH);
-  } else {
-    digitalWrite(RIGHT_IN1, LOW);
-    digitalWrite(RIGHT_IN2, LOW);
-  }
+static void applyMotors() {
+  setTrackPins(LEFT_IN1, LEFT_IN2, currentLeftDir);
+  setTrackPins(RIGHT_IN1, RIGHT_IN2, currentRightDir);
 }
 
 static void stopMotors() {
-  digitalWrite(LEFT_IN1, LOW);
-  digitalWrite(LEFT_IN2, LOW);
-  digitalWrite(RIGHT_IN1, LOW);
-  digitalWrite(RIGHT_IN2, LOW);
+  currentLeftDir = 0;
+  currentRightDir = 0;
+  applyMotors();
 }
 
-static void setLeftTrackAuto(int speedVal) {
-  speedVal = constrain(speedVal, -255, 255);
+// =====================================================
+// VALKYRIE / WAGNER
+// =====================================================
 
-  if (speedVal > AUTO_DRIVE_THRESHOLD) {
-    digitalWrite(LEFT_IN1, HIGH);
-    digitalWrite(LEFT_IN2, LOW);
-  } else if (speedVal < -AUTO_DRIVE_THRESHOLD) {
-    digitalWrite(LEFT_IN1, LOW);
-    digitalWrite(LEFT_IN2, HIGH);
+unsigned long getWagnerFullDurationMs(int index) {
+  float full = (60000.0 / WAGNER_BPM) / wagnerDurations[index];
+
+  if (full < 1.0) {
+    full = 1.0;
+  }
+
+  return (unsigned long)full;
+}
+
+void stopWagner() {
+  if (wagnerPlaying) {
+    noTone(BUZZER);
+  }
+
+  wagnerPlaying = false;
+  wagnerIndex = 0;
+  wagnerTonePhase = false;
+}
+
+void startWagner() {
+  if (wagnerPlaying) return;
+
+  wagnerPlaying = true;
+  wagnerIndex = 0;
+  wagnerTonePhase = true;
+  wagnerStepStart = millis();
+
+  tone(BUZZER, wagnerMelody[wagnerIndex]);
+}
+
+void updateWagner() {
+  if (!wagnerPlaying) return;
+
+  unsigned long now = millis();
+  unsigned long fullDuration = getWagnerFullDurationMs(wagnerIndex);
+
+  unsigned long toneDuration = (fullDuration * 88UL) / 100UL;
+  unsigned long gapDuration = fullDuration - toneDuration;
+
+  if (wagnerTonePhase) {
+    if (now - wagnerStepStart >= toneDuration) {
+      noTone(BUZZER);
+      wagnerTonePhase = false;
+      wagnerStepStart = now;
+    }
   } else {
-    digitalWrite(LEFT_IN1, LOW);
-    digitalWrite(LEFT_IN2, LOW);
+    if (now - wagnerStepStart >= gapDuration) {
+      wagnerIndex++;
+
+      if (wagnerIndex >= WAGNER_LEN) {
+        wagnerIndex = 0;
+      }
+
+      tone(BUZZER, wagnerMelody[wagnerIndex]);
+      wagnerTonePhase = true;
+      wagnerStepStart = now;
+    }
   }
 }
 
-static void setRightTrackAuto(int speedVal) {
-  speedVal = constrain(speedVal, -255, 255);
+// =====================================================
+// BEEP COFANIA
+// =====================================================
 
-  if (speedVal > AUTO_DRIVE_THRESHOLD) {
-    digitalWrite(RIGHT_IN1, HIGH);
-    digitalWrite(RIGHT_IN2, LOW);
-  } else if (speedVal < -AUTO_DRIVE_THRESHOLD) {
-    digitalWrite(RIGHT_IN1, LOW);
-    digitalWrite(RIGHT_IN2, HIGH);
-  } else {
-    digitalWrite(RIGHT_IN1, LOW);
-    digitalWrite(RIGHT_IN2, LOW);
+void stopReverseBeep() {
+  if (beepOn) {
+    noTone(BUZZER);
+    beepOn = false;
   }
 }
 
-// ===== MANUAL =====
+void updateReverseBeep() {
+  unsigned long now = millis();
+
+  if (!beepOn && now - lastBeepTime >= 500) {
+    tone(BUZZER, 500);
+    beepOn = true;
+    lastBeepTime = now;
+  }
+  else if (beepOn && now - lastBeepTime >= 500) {
+    noTone(BUZZER);
+    beepOn = false;
+    lastBeepTime = now;
+  }
+}
+
+void updateSound() {
+  if (wagnerEnabled) {
+    stopReverseBeep();
+
+    if (!wagnerPlaying) {
+      startWagner();
+    }
+
+    updateWagner();
+    return;
+  }
+
+  if (wagnerPlaying) {
+    stopWagner();
+  }
+
+  bool reversing = currentLeftDir < 0 && currentRightDir < 0;
+
+  if (reversing) {
+    updateReverseBeep();
+  } else {
+    stopReverseBeep();
+  }
+}
+
+// =====================================================
+// PRZYCISKI A1 / A2
+// =====================================================
+
+static void handleAuxButtons(uint8_t newMask) {
+  bool a1Now = (newMask & BTN_MASK_A1) != 0;
+  bool a1Prev = (lastButtonsMask & BTN_MASK_A1) != 0;
+
+  if (a1Now && !a1Prev) {
+    wagnerEnabled = !wagnerEnabled;
+
+    Serial.print("VALKYRIE=");
+    Serial.println(wagnerEnabled ? "ON" : "OFF");
+
+    if (!wagnerEnabled) {
+      stopWagner();
+    }
+  }
+
+  lastButtonsMask = newMask;
+}
+
+// =====================================================
+// MANUAL
+// =====================================================
 
 static void runManualMode(const Packet &p) {
-  const bool leftFwd = (p.buttons_bitmask & BTN_MASK_LEFT_FWD) != 0;
-  const bool leftRev = (p.buttons_bitmask & BTN_MASK_LEFT_REV) != 0;
+  const bool leftFwd  = (p.buttons_bitmask & BTN_MASK_LEFT_FWD) != 0;
+  const bool leftRev  = (p.buttons_bitmask & BTN_MASK_LEFT_REV) != 0;
   const bool rightFwd = (p.buttons_bitmask & BTN_MASK_RIGHT_FWD) != 0;
   const bool rightRev = (p.buttons_bitmask & BTN_MASK_RIGHT_REV) != 0;
 
   int leftDir = 0;
   int rightDir = 0;
 
-  if (leftFwd && !leftRev) leftDir = 1;
-  else if (!leftFwd && leftRev) leftDir = -1;
+  if (leftFwd && !leftRev) {
+    leftDir = 1;
+  } else if (!leftFwd && leftRev) {
+    leftDir = -1;
+  }
 
-  if (rightFwd && !rightRev) rightDir = 1;
-  else if (!rightFwd && rightRev) rightDir = -1;
+  if (rightFwd && !rightRev) {
+    rightDir = 1;
+  } else if (!rightFwd && rightRev) {
+    rightDir = -1;
+  }
 
-  setLeftTrack(leftDir);
-  setRightTrack(rightDir);
+  currentLeftDir = leftDir;
+  currentRightDir = rightDir;
+
+  applyMotors();
 
   if (debugEnabled) {
     Serial.print("MANUAL BUTTONS=0x");
-    if (p.buttons_bitmask < 16) Serial.print('0');
+
+    if (p.buttons_bitmask < 16) {
+      Serial.print('0');
+    }
+
     Serial.print(p.buttons_bitmask, HEX);
     Serial.print(" LEFT=");
     Serial.print(leftDir);
@@ -235,103 +305,43 @@ static void runManualMode(const Packet &p) {
   }
 }
 
-// ===== AUTO =====
+// =====================================================
+// AUTO — NA RAZIE WYŁĄCZONE
+// =====================================================
 
 static void runAutoMode() {
-  if (millis() - lastAutoUpdateMs < AUTO_UPDATE_MS) {
-    return;
-  }
-
-  lastAutoUpdateMs = millis();
-
-  uint16_t l, c, r;
-  snapshotAndClearIrCounters(l, c, r);
-
-  lastAutoL = l;
-  lastAutoC = c;
-  lastAutoR = r;
-
-  int leftSpeed = 0;
-  int rightSpeed = 0;
-
-  const bool lost = (l <= IR_NONE_THRESHOLD) &&
-                    (c <= IR_NONE_THRESHOLD) &&
-                    (r <= IR_NONE_THRESHOLD);
-
-  if (lost) {
-    if (lastSeenDirection < 0) {
-      leftSpeed = -AUTO_SEARCH_SPEED;
-      rightSpeed = AUTO_SEARCH_SPEED;
-    } else {
-      leftSpeed = AUTO_SEARCH_SPEED;
-      rightSpeed = -AUTO_SEARCH_SPEED;
-    }
-  } else {
-    int error = (int)r - (int)l;
-
-    if (error > IR_SIDE_MARGIN) {
-      lastSeenDirection = 1;
-    } else if (error < -IR_SIDE_MARGIN) {
-      lastSeenDirection = -1;
-    }
-
-    int base = AUTO_BASE_SPEED;
-
-    if (c < IR_STRONG_THRESHOLD) {
-      base = AUTO_SLOW_SPEED;
-    }
-
-    if (abs(error) > 6) {
-      base = AUTO_SLOW_SPEED;
-    }
-
-    int turn = constrain(error * AUTO_TURN_GAIN, -AUTO_MAX_TURN, AUTO_MAX_TURN);
-
-    leftSpeed = constrain(base + turn, -AUTO_MAX_SPEED, AUTO_MAX_SPEED);
-    rightSpeed = constrain(base - turn, -AUTO_MAX_SPEED, AUTO_MAX_SPEED);
-
-    if (c <= IR_NONE_THRESHOLD) {
-      if (r > l + IR_SIDE_MARGIN) {
-        leftSpeed = AUTO_SEARCH_SPEED;
-        rightSpeed = -AUTO_SEARCH_SPEED;
-      } else if (l > r + IR_SIDE_MARGIN) {
-        leftSpeed = -AUTO_SEARCH_SPEED;
-        rightSpeed = AUTO_SEARCH_SPEED;
-      }
-    }
-  }
-
-  setLeftTrackAuto(leftSpeed);
-  setRightTrackAuto(rightSpeed);
+  stopMotors();
 
   if (debugEnabled) {
-    Serial.print("AUTO IR L=");
-    Serial.print(l);
-    Serial.print(" C=");
-    Serial.print(c);
-    Serial.print(" R=");
-    Serial.print(r);
-    Serial.print(" -> LS=");
-    Serial.print(leftSpeed);
-    Serial.print(" RS=");
-    Serial.println(rightSpeed);
+    Serial.println("AUTO ignored - IR disabled");
   }
 }
 
-// ===== Serial/debug =====
+// =====================================================
+// SERIAL DEBUG
+// =====================================================
 
 static void printStatus() {
   Serial.print("STATUS MODE=");
   Serial.print(currentMode == MODE_MANUAL ? "MANUAL" : "AUTO");
-  Serial.print(" LAST_BUTTONS=0x");
-  if (data.buttons_bitmask < 16) Serial.print('0');
+
+  Serial.print(" BUTTONS=0x");
+  if (data.buttons_bitmask < 16) {
+    Serial.print('0');
+  }
   Serial.print(data.buttons_bitmask, HEX);
-  Serial.print(" IR L=");
-  Serial.print(lastAutoL);
-  Serial.print(" C=");
-  Serial.print(lastAutoC);
-  Serial.print(" R=");
-  Serial.println(lastAutoR);
+
+  Serial.print(" LEFT=");
+  Serial.print(currentLeftDir);
+
+  Serial.print(" RIGHT=");
+  Serial.print(currentRightDir);
+
+  Serial.print(" VALKYRIE=");
+  Serial.println(wagnerEnabled ? "ON" : "OFF");
+
+  Serial.print(" RADIO_CONNECTED=");
+  Serial.println(radio.isChipConnected() ? "YES" : "NO");
 }
 
 static void toUpperInPlace(char *s) {
@@ -347,18 +357,23 @@ static void processCommand(char *cmd) {
   if (strcmp(cmd, "DEBUG ON") == 0) {
     debugEnabled = true;
     Serial.println("DEBUG=ON");
-  } else if (strcmp(cmd, "DEBUG OFF") == 0) {
+  }
+  else if (strcmp(cmd, "DEBUG OFF") == 0) {
     debugEnabled = false;
     Serial.println("DEBUG=OFF");
-  } else if (strcmp(cmd, "DEBUG") == 0) {
+  }
+  else if (strcmp(cmd, "DEBUG") == 0) {
     debugEnabled = !debugEnabled;
     Serial.print("DEBUG=");
     Serial.println(debugEnabled ? "ON" : "OFF");
-  } else if (strcmp(cmd, "STATUS") == 0) {
+  }
+  else if (strcmp(cmd, "STATUS") == 0) {
     printStatus();
-  } else if (strcmp(cmd, "HELP") == 0) {
+  }
+  else if (strcmp(cmd, "HELP") == 0) {
     Serial.println("CMDS: DEBUG ON | DEBUG OFF | DEBUG | STATUS | HELP");
-  } else {
+  }
+  else {
     Serial.print("UNKNOWN CMD: ");
     Serial.println(cmd);
   }
@@ -374,11 +389,16 @@ static void handleSerialCommands() {
         processCommand(serialBuf);
         serialLen = 0;
       }
-    } else if (serialLen < sizeof(serialBuf) - 1) {
+    }
+    else if (serialLen < sizeof(serialBuf) - 1) {
       serialBuf[serialLen++] = c;
     }
   }
 }
+
+// =====================================================
+// SETUP / LOOP
+// =====================================================
 
 void setup() {
   pinMode(LEFT_IN1, OUTPUT);
@@ -386,9 +406,9 @@ void setup() {
   pinMode(RIGHT_IN1, OUTPUT);
   pinMode(RIGHT_IN2, OUTPUT);
 
+  pinMode(BUZZER, OUTPUT);
+
   stopMotors();
-  setupIrSensors();
-  resetIrCounters();
 
   Serial.begin(115200);
 
@@ -406,10 +426,13 @@ void setup() {
   data.mode = MODE_MANUAL;
   data.buttons_bitmask = 0;
 
-  lastAutoUpdateMs = millis();
+  lastPacketTime = millis();
 
   Serial.println("RX gotowy");
-  Serial.println("DEBUG domyslnie OFF");
+  Serial.println("Radio CE=9 CSN=10");
+  Serial.println("Listening pipe=1 addr=CTRL1 ch=76 rate=250KBPS pa=MIN");
+  Serial.println("Motors IN1=5 IN2=4 IN3=3 IN4=2");
+  Serial.println("A1 toggles VALKYRIE!!!");
 }
 
 void loop() {
@@ -419,17 +442,14 @@ void loop() {
     radio.read(&data, sizeof(data));
 
     currentMode = data.mode;
+    lastPacketTime = millis();
+
+    handleAuxButtons(data.buttons_bitmask);
 
     if (currentMode != lastMode) {
       lastMode = currentMode;
 
-      if (currentMode == MODE_AUTO) {
-        resetIrCounters();
-        lastAutoUpdateMs = millis();
-        stopMotors();
-      } else {
-        stopMotors();
-      }
+      stopMotors();
 
       if (debugEnabled) {
         Serial.print("TRYB -> ");
@@ -438,14 +458,23 @@ void loop() {
     }
 
     if (currentMode == MODE_MANUAL) {
-      lastManualPacketTime = millis();
       runManualMode(data);
+    } else {
+      runAutoMode();
     }
   }
 
-  if (currentMode == MODE_AUTO) {
-    runAutoMode();
-  } else if (millis() - lastManualPacketTime > SIGNAL_TIMEOUT) {
+  if (millis() - lastPacketTime > SIGNAL_TIMEOUT) {
     stopMotors();
   }
+
+  if (debugEnabled && millis() - lastPacketTime > 1000 && millis() - lastNoPacketDebugTime > 1000) {
+    lastNoPacketDebugTime = millis();
+    Serial.print("NO PACKETS for ");
+    Serial.print(millis() - lastPacketTime);
+    Serial.print(" ms, RADIO_CONNECTED=");
+    Serial.println(radio.isChipConnected() ? "YES" : "NO");
+  }
+
+  updateSound();
 }
